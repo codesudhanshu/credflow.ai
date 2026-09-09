@@ -5,8 +5,6 @@ completion requests against them, and reports aggregated usage and cost.
 
 Node.js 20 · TypeScript · Express 5 · MongoDB 6 · Vitest
 
-**Design document:** [`docs/superpowers/specs/2026-09-09-usage-metering-platform-design.md`](docs/superpowers/specs/2026-09-09-usage-metering-platform-design.md)
-
 ---
 
 ## 1. Setup and run
@@ -708,18 +706,20 @@ Specifically:
 
 - **Design conversation.** I worked through the ambiguities in the spec with it
   before writing code — the provisioning mechanism, whether to hash the API key,
-  where the rate limit sits in the check order, 403-versus-404. The design
-  document in `docs/` is the record of that, including the alternatives I
-  rejected. The decisions are mine; the dialogue sharpened them.
+  where the rate limit sits in the check order, 403-versus-404. I kept a
+  design document while working; it is not part of this submission, but the
+  decisions it records and the alternatives I rejected are summarised in the
+  Trade-offs and Assumptions sections above. The decisions are mine; the
+  dialogue sharpened them.
 - **Code generation.** Most of the implementation and test code was drafted with
-  AI and then reviewed and corrected by me. Three things I changed on review:
-  a request-id type collision with `pino-http` (it declares `req.id` as
-  `string | number`, so augmenting that name would have widened ours), the
-  test helper resetting
-  collections instead of booting a `mongod` per test (43s → 9s on the
-  completions file), and the default `/usage` window, which was ending at `now`
-  and silently excluding the newest event.
-- **README.** Drafted with AI from the design document, then edited — the
+  AI and then reviewed and corrected by me. Three things I changed on review: a
+  request-id type collision with `pino-http` (it declares `req.id` as
+  `string | number`, so augmenting that name would have widened ours everywhere
+  it is read), the test helper resetting collections instead of booting a
+  `mongod` per test (43s → 9s on the completions file), and the default
+  `/usage` window, which was ending at `now` and silently excluding the newest
+  event.
+- **README.** Drafted with AI from those design notes, then edited — the
   scaling section in particular, where I wanted the failure modes stated rather
   than just the fixes.
 - **Not AI.** The verification. Every status code and JSON body in the
