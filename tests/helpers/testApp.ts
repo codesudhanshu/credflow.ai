@@ -5,7 +5,7 @@ import { bootstrapDb } from '../../src/db/bootstrap.js';
 import { collections, type Collections } from '../../src/db/collections.js';
 import { seededRng } from '../../src/random.js';
 import { DeploymentsRepo } from '../../src/repositories/deployments.repo.js';
-import { MongoFixedWindowLimiter } from '../../src/ratelimit/mongoFixedWindow.js';
+import { createRateLimiter } from '../../src/ratelimit/factory.js';
 import { ProvisioningSweeper } from '../../src/workers/provisioningSweeper.js';
 import { buildServer } from '../../src/http/server.js';
 import { startMongo, type TestMongo } from './mongo.js';
@@ -37,7 +37,7 @@ export async function createTestApp(
 
   const { demoTenantId } = await bootstrapDb(mongo.db, env, clock);
   const cols = collections(mongo.db);
-  const rateLimiter = new MongoFixedWindowLimiter(cols, env.RATE_LIMIT_PER_MINUTE);
+  const rateLimiter = createRateLimiter(env, cols);
 
   const app = await buildServer({
     env,

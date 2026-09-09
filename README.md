@@ -35,14 +35,15 @@ MONGODB_URI=mongodb://localhost:27017 npm run dev
 Tests and typecheck:
 
 ```bash
-npm test         # 71 tests across 11 files, ~35s
+npm test         # 93 tests across 12 files, ~35s
 npm run typecheck
 npm run build
 ```
 
 Every configuration value has a working default — see [`.env.example`](.env.example).
-Useful ones for poking at the service: `PROVISIONING_MS` (default `10000`) and
-`RATE_LIMIT_PER_MINUTE` (default `100`).
+Useful ones for poking at the service: `PROVISIONING_MS` (default `10000`),
+`RATE_LIMIT_PER_MINUTE` (default `100`, the sustained rate) and
+`RATE_LIMIT_BURST` (defaults to the rate; it is the leaky bucket's capacity).
 
 ### Walkthrough
 
@@ -174,27 +175,43 @@ curl -s -X POST localhost:3000/v1/$DEP/completions \
 #           "request_id":"req_x3g2nv4g6o9n"}}
 ```
 
-**429.** Easiest to see with a small limit:
+**429.** Rate limiting is a leaky bucket (GCRA), so the shape to expect is
+"a burst up to the capacity, then one slot every emission interval" rather than
+"a counter that resets on the minute". At the default 100/min the emission
+interval is 600ms — faster than a shell `curl` loop can issue requests, so a
+sequential loop will never saturate the bucket. Lower the rate to see it:
 
 ```bash
-RATE_LIMIT_PER_MINUTE=5 PROVISIONING_MS=1000 node dist/index.js
-# …create a deployment, then send seven requests:
-# 1..5 -> 200, 6 -> 429, 7 -> 429
+RATE_LIMIT_PER_MINUTE=6 RATE_LIMIT_BURST=2 PROVISIONING_MS=1000 node dist/index.js
+# …create a deployment, then send four requests back-to-back:
+# 1 -> 200, 2 -> 200, 3 -> 429, 4 -> 429
 ```
+
+The third request:
 
 ```
 HTTP/1.1 429 Too Many Requests
-retry-after: 13
-x-ratelimit-limit: 5
+retry-after: 10
+x-ratelimit-limit: 2
 x-ratelimit-remaining: 0
-x-ratelimit-reset: 1788980640
+x-ratelimit-reset: 1788982196
 
 {"error":{"code":"rate_limit_exceeded",
-          "message":"Rate limit of 5 requests per minute exceeded.",
-          "request_id":"req_ajc0ok41hxh8"}}
+          "message":"Rate limit of 6 requests per minute with a burst of 2 exceeded.",
+          "request_id":"req_kiafl4dguy04"}}
 ```
 
-`GET /usage` then reports exactly `5` requests. Rejected requests are never billed.
+`retry-after: 10` is one emission interval — the moment the next slot drains —
+not "wait out the window". Observed behaviour from that run: still `429` three
+seconds later, `200` once the slot drained about ten seconds after the burst,
+then `429` again immediately, because exactly one slot had freed. `GET /usage`
+reported `3` requests: the admitted ones and nothing else.
+
+At the default configuration the spec's literal expectation holds — 100
+requests back-to-back succeed and the 101st returns `429`, which is what
+`tests/integration/completions.test.ts` asserts.
+
+Rejected requests are never billed.
 
 `X-Account-Key` is accepted on `POST /deployments` and falls back to a seeded
 demo tenant, so none of the commands above need account setup. An
@@ -246,8 +263,11 @@ prefix makes a misrouted id obvious at a glance.
   cost_micro_usd: Int32,   // frozen at write time
   occurred_at, request_id }
 
-// rate_limit_buckets — ephemeral, TTL-expired
-{ _id: "<api_key_id>:<epoch_minute>", count: Int32, expires_at }
+// rate_limit_buckets — one leaky bucket per key, ephemeral, TTL-expired
+{ _id: "key_…",     // the api key id
+  tat: Date,        // theoretical arrival time — the bucket's fill level
+  allowed: bool,    // decision from the last consume(), returned not state
+  expires_at }
 ```
 
 Indexes:
@@ -379,10 +399,13 @@ targeted single-shard query rather than a scatter-gather. Hashed sharding on
 `tenant_id` also spreads the write load evenly, whereas sharding on
 `occurred_at` would make the newest chunk a hotspot for every write.
 
-**Move the limiter out of the database.** One Redis `INCR` plus `EXPIRE` per
-request, or a token bucket in the same place. At 10k rps this also wants to
-become a sliding window or token bucket, because a fixed window's boundary
-burst is 20k requests in two seconds.
+**Move the limiter out of the database.** The algorithm does not need to
+change — GCRA is what you would run in Redis anyway, and it ports directly: one
+Lua script, or `redis-cell`, holding the same single timestamp per key. What
+changes is where the state lives, because at 10k rps the limiter's write is
+half of the per-request database traffic. Redis also makes the per-key
+serialization cheap enough that the burst can be tightened without the
+round-trip cost showing up in p99.
 
 **The failure modes this buys, and what to do about them.** Being explicit about
 these is the point — each fix trades one problem for another:
@@ -407,8 +430,10 @@ these is the point — each fix trades one problem for another:
 
 ## 4. What I would do differently with more time
 
-- **Sliding-window or token-bucket rate limiting** in Redis, removing both the
-  boundary burst and the per-request database write.
+- **Move the leaky bucket into Redis**, removing the per-request database
+  write. The algorithm stays; only the store changes.
+- **Per-endpoint and per-tenant limits** on top of the per-key one, since a
+  tenant with many keys can currently exceed any intended account-level rate.
 - **Hash-only API key storage** with a one-time reveal at creation, instead of
   keeping plaintext to satisfy the spec's repeated `GET` (see Assumption 1).
 - **Real tenant authentication** — `X-Account-Key` required, every query scoped
@@ -437,18 +462,49 @@ to provide. Section 3 describes how to remove the latency cost without
 reintroducing loss; that machinery is not built here because it is not warranted
 at this scale.
 
-**Fixed window rather than sliding.** One write, trivially correct within a
-window, and it satisfies the spec's literal "max 100 requests per minute". The
-cost is a boundary burst: 100 requests at 11:59:59 plus 100 at 12:00:00. This is
-documented rather than hidden; a sliding-window counter is about 25 more lines
-and two reads, and a token bucket is what a real gateway uses.
+**Leaky bucket (GCRA) rather than a fixed window.** A fixed-window counter is
+one `$inc` and is trivially correct within a window, but it admits 2× the limit
+across a boundary — 100 requests at 11:59:59 plus 100 at 12:00:00 is 200 in a
+millisecond, and a caller can sustain that indefinitely by aiming at
+boundaries. The leaky bucket bounds the instantaneous burst to the capacity and
+then admits at most one request per emission interval for as long as the caller
+keeps pushing, so a sustained attack is throttled to the configured rate rather
+than to twice it.
+
+To be precise about what this does *not* fix: over a rolling 60 seconds
+starting from an empty bucket, admissions are still bounded by
+`capacity + rate × elapsed` — about 2× — and that is inherent to any bucket
+algorithm. Only a sliding-window log is exact, at the cost of storing a
+timestamp per request. What the bucket buys is that the excess can no longer
+arrive all at once, and that burst becomes tunable independently of rate
+(`RATE_LIMIT_BURST=1` gives strict smoothing at one request per 600ms).
+
+**The metering form of a leaky bucket, not the queueing form.** A leaky bucket
+can either reject overflow or buffer it and drain at a constant rate. The spec
+requires `429` when the limit is exceeded, so overflow must be rejected;
+queueing would delay the request instead. In metering form the algorithm is
+equivalent to a token bucket for admission purposes — the difference is that
+the state is a single timestamp rather than a token count plus a refill
+timestamp, which is what makes the next point possible.
+
+**One atomic round trip, no retry loop.** Because the bucket is one timestamp,
+the entire read-decide-write cycle fits in a single `findOneAndUpdate` with an
+aggregation pipeline. The alternative — read the bucket, decide in application
+code, then compare-and-set — costs a second round trip and retries hardest
+exactly when one caller is hammering one key, which is the case that matters.
+The cost of the pipeline is that the admission rule exists twice: once as a
+pure function (`admit()`) used by the in-memory backend and unit-tested
+exhaustively, and once in MQL. A differential test drives both backends through
+the same 300-step irregular sequence and asserts identical decisions, so they
+cannot silently diverge.
 
 **Rate limiter in MongoDB rather than an in-process `Map`.** The Map is faster
-and needs no round trip, but it makes the limit per-instance rather than per-key
-— which would contradict the multi-instance guarantee the state machine
-provides. Being inconsistent about that seemed worse than paying for one upsert.
-Both implementations exist behind a `RateLimiter` interface and are selected by
-`RATE_LIMIT_STORE`.
+and needs no round trip, but it makes the limit per-instance rather than
+per-key — which would contradict the multi-instance guarantee the state machine
+provides. Being inconsistent about that seemed worse than paying for one write.
+Both backends sit behind a `RateLimiter` interface, selected by
+`RATE_LIMIT_STORE`. The bucket is also one document per key rather than one per
+key per window, so an idle key leaves nothing behind once the TTL fires.
 
 **Plaintext `secret` in `api_keys`.** A real breach of correct practice, made
 deliberately: the spec requires `GET /deployments/:id` to return `api_key` on
@@ -499,8 +555,11 @@ Where the spec was silent or self-conflicting, these are the calls I made.
    authentication path, so dropping `secret` would leave the system working.
 2. **An unknown `deployment_id` on the completions endpoint returns 403, not
    404** — see Trade-offs.
-3. **Fixed-window rate limiting** permits up to 2× the limit across a window
-   boundary.
+3. **Rate limiting is a leaky bucket (GCRA)** with the burst capacity defaulting
+   to the per-minute rate, so "max 100 per minute" is enforced as "100 may
+   arrive at once, then one slot drains every 600ms". A reviewer sending 101
+   requests back-to-back still sees the 101st rejected. Burst is tunable
+   separately via `RATE_LIMIT_BURST`.
 4. **`day` grouping is UTC only.** The spec has no notion of a per-tenant
    billing timezone.
 5. **`GET /usage` takes the API key as a query parameter**, per the spec. This
@@ -554,7 +613,8 @@ src/
                               collections, idempotent bootstrap
   repositories/               queries only, no business rules
   services/                   orchestration: deployments, completions, usage
-  ratelimit/                  RateLimiter interface + Mongo and memory backends
+  ratelimit/                  leaky bucket (GCRA): pure admission rule +
+                              Mongo and in-memory backends behind one interface
   workers/                    provisioning sweeper
   http/                       server, routes, Zod schemas, error handler
   index.ts                    env → db → bootstrap → server → sweeper
@@ -573,7 +633,7 @@ milliseconds.
 ### What the tests cover, and why those things
 
 The spec asks for at least two meaningful tests and says the choice matters more
-than coverage. 71 tests across 11 files, all targeting invariants whose failure
+than coverage. 93 tests across 12 files, all targeting invariants whose failure
 would produce wrong money or wrong state. **No test sleeps** — a `FakeClock` is
 injected, so the ten-second provisioning path is exercised instantly.
 
@@ -586,7 +646,8 @@ injected, so the ten-second provisioning path is exercised instantly.
 | `integration/completions` | **No rejected request ever writes a billing record** — asserted for all seven rejection cases |
 | `integration/completions` | N requests produce exactly N events whose token sums match the responses |
 | `integration/completions` | An `Idempotency-Key` retry replays the stored event and does not double-charge |
-| `integration/ratelimit` | Boundary is exact, windows refill, keys are isolated — for both backends |
+| `unit/gcra` | The bucket admits exactly its capacity, a rejection never pushes it forward, and sustained traffic is spaced at the emission interval |
+| `integration/ratelimit` | Both backends agree on all 300 steps of an irregular sequence — the differential test that keeps the MQL pipeline honest against the pure rule |
 | `integration/usage` | Day buckets are UTC, the range excludes `to`, and `/usage` reconciles with real requests |
 | `integration/bootstrap` | Validators refuse a bad enum and a non-integer token count |
 

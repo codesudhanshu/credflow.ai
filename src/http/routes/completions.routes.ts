@@ -10,9 +10,11 @@ import { CompletionParams, parseBearer } from '../schemas/completions.schema.js'
 function setRateLimitHeaders(reply: FastifyReply, decision: RateLimitDecision): void {
   void reply.header('x-ratelimit-limit', String(decision.limit));
   void reply.header('x-ratelimit-remaining', String(decision.remaining));
+  // With a leaky bucket there is no window to wait out — the useful value is
+  // when the next slot drains, which for an unthrottled caller is now.
   void reply.header(
     'x-ratelimit-reset',
-    String(Math.floor(decision.resetAt.getTime() / 1_000)),
+    String(Math.floor(decision.nextAllowedAt.getTime() / 1_000)),
   );
 }
 

@@ -61,19 +61,27 @@ export function deploymentNotReady(deploymentId: string, effectiveStatus: string
   );
 }
 
+/**
+ * `burst` is the bucket capacity and `ratePerMinute` the sustained rate; with
+ * the default configuration they are equal. The message states both, because
+ * quoting the capacity alone as a per-minute figure would be wrong whenever
+ * the burst has been tuned separately.
+ */
 export function rateLimitExceeded(
-  limit: number,
+  ratePerMinute: number,
+  burst: number,
   retryAfterSeconds: number,
   resetAtEpochSeconds: number,
 ): AppError {
-  return new AppError(
-    'rate_limit_exceeded',
-    `Rate limit of ${limit} requests per minute exceeded.`,
-    {
-      'retry-after': String(retryAfterSeconds),
-      'x-ratelimit-limit': String(limit),
-      'x-ratelimit-remaining': '0',
-      'x-ratelimit-reset': String(resetAtEpochSeconds),
-    },
-  );
+  const policy =
+    burst === ratePerMinute
+      ? `${ratePerMinute} requests per minute`
+      : `${ratePerMinute} requests per minute with a burst of ${burst}`;
+
+  return new AppError('rate_limit_exceeded', `Rate limit of ${policy} exceeded.`, {
+    'retry-after': String(retryAfterSeconds),
+    'x-ratelimit-limit': String(burst),
+    'x-ratelimit-remaining': '0',
+    'x-ratelimit-reset': String(resetAtEpochSeconds),
+  });
 }

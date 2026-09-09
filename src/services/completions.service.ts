@@ -56,12 +56,13 @@ export class CompletionsService {
     if (!decision.allowed) {
       const retryAfter = Math.max(
         1,
-        Math.ceil((decision.resetAt.getTime() - now.getTime()) / 1_000),
+        Math.ceil((decision.nextAllowedAt.getTime() - now.getTime()) / 1_000),
       );
       throw rateLimitExceeded(
+        decision.ratePerMinute,
         decision.limit,
         retryAfter,
-        Math.floor(decision.resetAt.getTime() / 1_000),
+        Math.floor(decision.nextAllowedAt.getTime() / 1_000),
       );
     }
 

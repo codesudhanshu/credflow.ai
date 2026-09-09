@@ -55,9 +55,19 @@ export interface UsageEventDoc {
   request_id: string;
 }
 
+/**
+ * One leaky bucket per API key. Removed by a TTL index once it has drained,
+ * so an idle key leaves nothing behind.
+ */
 export interface RateLimitBucketDoc {
-  /** `<api_key_id>:<epoch_minute>` */
+  /** The api key id. */
   _id: string;
-  count: number;
+  /**
+   * Theoretical arrival time — the bucket's fill level expressed as the
+   * instant at which it would next be empty.
+   */
+  tat: Date;
+  /** Decision from the most recent consume(). Returned to the caller, not state. */
+  allowed: boolean;
   expires_at: Date;
 }

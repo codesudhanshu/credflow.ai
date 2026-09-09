@@ -15,7 +15,10 @@ const EnvSchema = z.object({
   PROVISIONING_MS: z.coerce.number().int().nonnegative().default(10_000),
   SWEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(1_000),
 
+  /** Sustained rate of the leaky bucket, per API key. */
   RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(100),
+  /** Bucket capacity. Defaults to the per-minute rate; lower it to smooth harder. */
+  RATE_LIMIT_BURST: z.coerce.number().int().positive().optional(),
   RATE_LIMIT_STORE: z.enum(['mongo', 'memory']).default('mongo'),
 
   DEMO_ACCOUNT_KEY: z.string().min(1).default('demo-account-key'),

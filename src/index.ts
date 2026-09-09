@@ -5,8 +5,7 @@ import { collections } from './db/collections.js';
 import { connectDb } from './db/client.js';
 import { buildServer } from './http/server.js';
 import { systemRng } from './random.js';
-import { MemoryFixedWindowLimiter } from './ratelimit/memoryFixedWindow.js';
-import { MongoFixedWindowLimiter } from './ratelimit/mongoFixedWindow.js';
+import { createRateLimiter } from './ratelimit/factory.js';
 import { DeploymentsRepo } from './repositories/deployments.repo.js';
 import { ProvisioningSweeper } from './workers/provisioningSweeper.js';
 
@@ -16,10 +15,7 @@ async function main(): Promise<void> {
   await bootstrapDb(handle.db, env, systemClock);
 
   const cols = collections(handle.db);
-  const rateLimiter =
-    env.RATE_LIMIT_STORE === 'memory'
-      ? new MemoryFixedWindowLimiter(env.RATE_LIMIT_PER_MINUTE)
-      : new MongoFixedWindowLimiter(cols, env.RATE_LIMIT_PER_MINUTE);
+  const rateLimiter = createRateLimiter(env, cols);
 
   const app = await buildServer({
     env,

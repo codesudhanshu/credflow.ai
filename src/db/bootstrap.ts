@@ -99,10 +99,11 @@ const VALIDATORS: Record<string, Document> = {
   rate_limit_buckets: {
     $jsonSchema: {
       bsonType: 'object',
-      required: ['_id', 'count', 'expires_at'],
+      required: ['_id', 'tat', 'allowed', 'expires_at'],
       properties: {
         _id: { bsonType: 'string' },
-        count: { bsonType: 'int', minimum: 0 },
+        tat: { bsonType: 'date' },
+        allowed: { bsonType: 'bool' },
         expires_at: { bsonType: 'date' },
       },
       additionalProperties: false,
