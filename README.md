@@ -3,7 +3,7 @@
 A service that provisions mock model deployments, meters authenticated
 completion requests against them, and reports aggregated usage and cost.
 
-Node.js 20 · TypeScript · Fastify 5 · MongoDB 6 · Vitest
+Node.js 20 · TypeScript · Express 5 · MongoDB 6 · Vitest
 
 **Design document:** [`docs/superpowers/specs/2026-09-09-usage-metering-platform-design.md`](docs/superpowers/specs/2026-09-09-usage-metering-platform-design.md)
 
@@ -35,7 +35,7 @@ MONGODB_URI=mongodb://localhost:27017 npm run dev
 Tests and typecheck:
 
 ```bash
-npm test         # 93 tests across 12 files, ~35s
+npm test         # 97 tests across 12 files, ~45s
 npm run typecheck
 npm run build
 ```
@@ -165,6 +165,16 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:3000/v1/$DEP/completi
 # 404 — unknown deployment on the control plane
 curl -s -o /dev/null -w '%{http_code}\n' localhost:3000/deployments/dep_nope
 # 404
+
+# 404 — unknown route, same envelope as everything else
+curl -s -o /dev/null -w '%{http_code}\n' localhost:3000/not-a-route
+# 404
+
+# 400 — malformed JSON, caught by the body parser and mapped to the envelope
+curl -s -X POST localhost:3000/deployments \
+  -H 'content-type: application/json' -d '{"model":'
+# {"error":{"code":"validation_failed","message":"Unexpected end of JSON input",
+#           "request_id":"req_7ua8jewesu08"}}
 
 # 409 — terminated (or still provisioning)
 curl -sX DELETE localhost:3000/deployments/$DEP > /dev/null
@@ -454,6 +464,33 @@ these is the point — each fix trades one problem for another:
 
 ## 5. Trade-offs
 
+**Express 5 rather than Fastify.** Express is the framework I am most fluent
+in, and on a take-home where I have to defend every line, fluency beats
+benchmarks. To be accurate about the comparison rather than flattering the
+choice: Fastify is a perfectly production-grade framework — it is faster,
+ships pino and schema-based validation and serialization in the box, and its
+`inject()` gives portless HTTP tests for free. Express is more *ubiquitous*,
+which is a different property from more *production-ready*.
+
+What the choice cost, and how each was covered: `inject()` is replaced by
+`supertest`, which opens an ephemeral socket per request — slightly slower, no
+port management either way. Request logging needed `pino-http` wiring by hand.
+Fastify's plugin encapsulation is replaced by route factory functions that take
+their dependencies as arguments — arguably an improvement, since a route can
+now only be mounted with what it actually needs, and there is no framework
+decoration to reach through.
+
+What made the migration cheap at all: only `src/http/` changed. `domain/`,
+`repositories/`, `services/`, `ratelimit/` and `workers/` are
+framework-agnostic and were untouched, which is the payoff for the layering
+rather than a happy accident.
+
+One Express-specific note worth stating: **Express 5** forwards a rejected
+promise from an async handler to the error middleware on its own. Express 4 did
+not, and would have needed a wrapper around every handler or
+`express-async-errors`. The whole rejection matrix in the test suite is thrown
+from async handlers, so the suite is what proves this rather than my assuming it.
+
 **Synchronous metering, at the cost of latency.** The usage event is written
 before the response is sent, and only on success. A failed insert returns 500,
 so the caller gets neither output nor a charge. Fire-and-forget would be faster
@@ -616,8 +653,15 @@ src/
   ratelimit/                  leaky bucket (GCRA): pure admission rule +
                               Mongo and in-memory backends behind one interface
   workers/                    provisioning sweeper
-  http/                       server, routes, Zod schemas, error handler
-  index.ts                    env → db → bootstrap → server → sweeper
+  logger.ts                   pino instance, created once and passed in
+  http/
+    server.ts                 buildServer() — middleware order, no listen()
+    deps.ts                   AppDeps, so route factories need no cycle back
+    errorHandler.ts           error middleware + not-found, one envelope
+    middleware/requestId.ts   correlation id, honours a caller-supplied one
+    routes/                   Router factories taking their deps explicitly
+    schemas/                  Zod request/response contracts
+  index.ts                    env → db → bootstrap → server → sweeper → listen
 
 tests/
   unit/                       domain, config, error taxonomy, server skeleton
@@ -626,14 +670,18 @@ tests/
 ```
 
 `buildServer()` is separate from `listen()`, so tests exercise real HTTP through
-`fastify.inject()` without binding a port. `domain/` imports nothing that
+`supertest` without binding a port. Middleware order in `server.ts` is load-bearing
+and commented as such: the correlation id is assigned before anything can log or
+fail, the body parser runs before any route reads `req.body`, the not-found
+handler sits after every route, and the error middleware is registered last
+because Express identifies it by arity. `domain/` imports nothing that
 performs I/O, which is why the state machine and the pricing arithmetic test in
 milliseconds.
 
 ### What the tests cover, and why those things
 
 The spec asks for at least two meaningful tests and says the choice matters more
-than coverage. 93 tests across 12 files, all targeting invariants whose failure
+than coverage. 97 tests across 12 files, all targeting invariants whose failure
 would produce wrong money or wrong state. **No test sleeps** — a `FakeClock` is
 injected, so the ten-second provisioning path is exercised instantly.
 
@@ -665,7 +713,9 @@ Specifically:
   rejected. The decisions are mine; the dialogue sharpened them.
 - **Code generation.** Most of the implementation and test code was drafted with
   AI and then reviewed and corrected by me. Three things I changed on review:
-  the error handler's type narrowing under Fastify 5, the test helper resetting
+  a request-id type collision with `pino-http` (it declares `req.id` as
+  `string | number`, so augmenting that name would have widened ours), the
+  test helper resetting
   collections instead of booting a `mongod` per test (43s → 9s on the
   completions file), and the default `/usage` window, which was ending at `now`
   and silently excluding the newest event.

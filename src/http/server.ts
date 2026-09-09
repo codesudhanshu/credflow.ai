@@ -1,63 +1,54 @@
-import Fastify, { type FastifyInstance } from 'fastify';
-import type { Db } from 'mongodb';
-import type { Env } from '../config/env.js';
-import type { Clock } from '../clock.js';
-import type { Rng } from '../random.js';
-import type { RateLimiter } from '../ratelimit/limiter.js';
-import { newId } from '../ids.js';
-import { registerErrorHandler } from './errorHandler.js';
-import { deploymentRoutes } from './routes/deployments.routes.js';
-import { completionRoutes } from './routes/completions.routes.js';
-import { usageRoutes } from './routes/usage.routes.js';
+import express, { type Express } from 'express';
+import { pinoHttp } from 'pino-http';
+import type { AppDeps } from './deps.js';
+import { errorHandler, notFoundHandler } from './errorHandler.js';
+import { requestId } from './middleware/requestId.js';
+import { createDeploymentRoutes } from './routes/deployments.routes.js';
+import { createCompletionRoutes } from './routes/completions.routes.js';
+import { createUsageRoutes } from './routes/usage.routes.js';
+
+export type { AppDeps };
 
 /**
- * Everything the HTTP layer needs, passed in rather than imported, so tests
- * can substitute a fake clock, a seeded RNG, and an ephemeral database.
- * `db` and `rateLimiter` are optional only so the skeleton can be exercised
- * without them; route plugins that need them assert their presence.
+ * Builds the app without listening, so tests drive real HTTP through supertest
+ * without binding a port. `listen()` belongs to the entrypoint alone.
+ *
+ * Middleware order matters and is deliberate: the correlation id is assigned
+ * before anything can log or fail, the body parser runs before any route reads
+ * `req.body`, the not-found handler sits after every route, and the error
+ * handler is registered last because Express identifies it by arity.
  */
-export interface AppDeps {
-  env: Env;
-  clock: Clock;
-  rng: Rng;
-  db?: Db;
-  rateLimiter?: RateLimiter;
-}
+export function buildServer(deps: AppDeps): Express {
+  const app = express();
 
-declare module 'fastify' {
-  interface FastifyInstance {
-    deps: AppDeps;
-  }
-}
+  // Nothing gains from advertising the framework.
+  app.disable('x-powered-by');
 
-export async function buildServer(deps: AppDeps): Promise<FastifyInstance> {
-  const app = Fastify({
-    logger: { level: deps.env.LOG_LEVEL },
-    genReqId: (req) => {
-      const supplied = req.headers['x-request-id'];
-      return typeof supplied === 'string' && supplied.length > 0 ? supplied : newId('req', 12);
-    },
+  app.use(requestId);
+  app.use(
+    pinoHttp({
+      logger: deps.logger,
+      // Reuse the id already assigned above rather than letting pino mint a
+      // second, different one.
+      genReqId: (req) => (req as unknown as { requestId: string }).requestId,
+    }),
+  );
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/health', (_req, res) => {
+    res.json({ status: 'ok' });
   });
 
-  app.decorate('deps', deps);
-
-  app.addHook('onSend', async (req, reply) => {
-    void reply.header('x-request-id', String(req.id));
-  });
-
-  registerErrorHandler(app);
-
-  app.get('/health', async () => ({ status: 'ok' }));
-
-  // Route plugins need a database; the skeleton is usable without one so the
-  // transport-level behaviour can be tested in isolation.
   if (deps.db) {
-    await app.register(deploymentRoutes, { prefix: '/deployments' });
-    await app.register(usageRoutes, { prefix: '/usage' });
+    app.use('/deployments', createDeploymentRoutes(deps, deps.db));
+    app.use('/usage', createUsageRoutes(deps, deps.db));
   }
   if (deps.db && deps.rateLimiter) {
-    await app.register(completionRoutes, { prefix: '/v1' });
+    app.use('/v1', createCompletionRoutes(deps, deps.db, deps.rateLimiter));
   }
+
+  app.use(notFoundHandler);
+  app.use(errorHandler(deps.logger));
 
   return app;
 }

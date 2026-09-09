@@ -1,29 +1,32 @@
-import type { FastifyPluginAsync, FastifyReply } from 'fastify';
+import { Router, type Response } from 'express';
+import type { Db } from 'mongodb';
 import { collections } from '../../db/collections.js';
 import { ApiKeysRepo } from '../../repositories/apiKeys.repo.js';
 import { DeploymentsRepo } from '../../repositories/deployments.repo.js';
 import { UsageEventsRepo } from '../../repositories/usageEvents.repo.js';
 import { CompletionsService } from '../../services/completions.service.js';
-import type { RateLimitDecision } from '../../ratelimit/limiter.js';
+import type { RateLimitDecision, RateLimiter } from '../../ratelimit/limiter.js';
+import type { AppDeps } from '../deps.js';
+import { singleHeader } from '../headers.js';
 import { CompletionParams, parseBearer } from '../schemas/completions.schema.js';
 
-function setRateLimitHeaders(reply: FastifyReply, decision: RateLimitDecision): void {
-  void reply.header('x-ratelimit-limit', String(decision.limit));
-  void reply.header('x-ratelimit-remaining', String(decision.remaining));
+function setRateLimitHeaders(res: Response, decision: RateLimitDecision): void {
+  res.setHeader('x-ratelimit-limit', String(decision.limit));
+  res.setHeader('x-ratelimit-remaining', String(decision.remaining));
   // With a leaky bucket there is no window to wait out — the useful value is
   // when the next slot drains, which for an unthrottled caller is now.
-  void reply.header(
+  res.setHeader(
     'x-ratelimit-reset',
     String(Math.floor(decision.nextAllowedAt.getTime() / 1_000)),
   );
 }
 
-export const completionRoutes: FastifyPluginAsync = async (app) => {
-  const { env, clock, rng, db, rateLimiter } = app.deps;
-  if (!db || !rateLimiter) {
-    throw new Error('completionRoutes requires a database and a rate limiter');
-  }
-
+export function createCompletionRoutes(
+  deps: AppDeps,
+  db: Db,
+  rateLimiter: RateLimiter,
+): Router {
+  const { env, clock, rng } = deps;
   const cols = collections(db);
   const service = new CompletionsService(
     new ApiKeysRepo(cols),
@@ -35,18 +38,21 @@ export const completionRoutes: FastifyPluginAsync = async (app) => {
     env,
   );
 
-  app.post('/:deployment_id/completions', async (req, reply) => {
+  const router = Router();
+
+  router.post('/:deployment_id/completions', async (req, res) => {
     const { deployment_id } = CompletionParams.parse(req.params);
-    const idempotencyKey = req.headers['idempotency-key'];
 
     const result = await service.complete({
       deploymentId: deployment_id,
-      bearerToken: parseBearer(req.headers.authorization),
+      bearerToken: parseBearer(singleHeader(req.headers.authorization)),
       body: req.body,
-      idempotencyKey: typeof idempotencyKey === 'string' ? idempotencyKey : null,
+      idempotencyKey: singleHeader(req.headers['idempotency-key']) ?? null,
     });
 
-    setRateLimitHeaders(reply, result.rateLimit);
-    return result.body;
+    setRateLimitHeaders(res, result.rateLimit);
+    res.json(result.body);
   });
-};
+
+  return router;
+}

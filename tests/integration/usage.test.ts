@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import type { LightMyRequestResponse } from 'fastify';
+import request from 'supertest';
 import { computeCostMicroUsd } from '../../src/domain/pricing.js';
 import { createTestApp, type TestApp } from '../helpers/testApp.js';
+
+type Response = Awaited<ReturnType<ReturnType<typeof request>['get']>>;
 
 describe('usage and billing', () => {
   let ctx: TestApp;
@@ -19,15 +21,18 @@ describe('usage and billing', () => {
   });
 
   async function readyDeployment(model = 'model-a'): Promise<{ id: string; apiKey: string }> {
-    const created = await ctx.app.inject({
-      method: 'POST',
-      url: '/deployments',
-      payload: { model },
-    });
-    const id = created.json().deployment_id as string;
+    const created = await request(ctx.app).post('/deployments').send({ model });
+    const id = created.body.deployment_id as string;
     ctx.clock.advance(10_000);
-    const ready = await ctx.app.inject({ method: 'GET', url: `/deployments/${id}` });
-    return { id, apiKey: ready.json().api_key as string };
+    const ready = await request(ctx.app).get(`/deployments/${id}`);
+    return { id, apiKey: ready.body.api_key as string };
+  }
+
+  async function complete(id: string, apiKey: string, prompt: string): Promise<Response> {
+    return request(ctx.app)
+      .post(`/v1/${id}/completions`)
+      .set('authorization', `Bearer ${apiKey}`)
+      .send({ prompt });
   }
 
   /** Writes events directly so timestamps are exact rather than clock-driven. */
@@ -54,9 +59,8 @@ describe('usage and billing', () => {
     }
   }
 
-  async function get(queryString: string): Promise<LightMyRequestResponse> {
-    return await ctx.app.inject({ method: 'GET', url: `/usage?${queryString}` });
-  }
+  const get = async (queryString: string): Promise<Response> =>
+    request(ctx.app).get(`/usage?${queryString}`);
 
   it('groups by UTC day and excludes the exclusive upper bound', async () => {
     const { id, apiKey } = await readyDeployment();
@@ -72,8 +76,8 @@ describe('usage and billing', () => {
     const res = await get(
       `api_key=${apiKey}&from=2026-09-08T00:00:00.000Z&to=2026-09-10T00:00:00.000Z&group_by=day`,
     );
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
+    expect(res.status).toBe(200);
+    const body = res.body;
 
     expect(body.breakdown.map((b: { key: string }) => b.key)).toEqual([
       '2026-09-08',
@@ -131,7 +135,7 @@ describe('usage and billing', () => {
       await get(
         `api_key=${apiKey}&from=2026-09-09T00:00:00.000Z&to=2026-09-10T00:00:00.000Z&group_by=model`,
       )
-    ).json();
+    ).body;
 
     expect(body.breakdown.map((b: { key: string }) => b.key)).toEqual([
       'model-a',
@@ -154,19 +158,14 @@ describe('usage and billing', () => {
     let inputTokens = 0;
     let outputTokens = 0;
     for (const prompt of ['a'.repeat(40), 'b'.repeat(80), 'c'.repeat(12)]) {
-      const res = await ctx.app.inject({
-        method: 'POST',
-        url: `/v1/${id}/completions`,
-        payload: { prompt },
-        headers: { authorization: `Bearer ${apiKey}` },
-      });
-      expect(res.statusCode).toBe(200);
+      const res = await complete(id, apiKey, prompt);
+      expect(res.status).toBe(200);
       requests += 1;
-      inputTokens += res.json().input_tokens as number;
-      outputTokens += res.json().output_tokens as number;
+      inputTokens += res.body.input_tokens as number;
+      outputTokens += res.body.output_tokens as number;
     }
 
-    const body = (await get(`api_key=${apiKey}&group_by=model`)).json();
+    const body = (await get(`api_key=${apiKey}&group_by=model`)).body;
     expect(body.totals.requests).toBe(requests);
     expect(body.totals.input_tokens).toBe(inputTokens);
     expect(body.totals.output_tokens).toBe(outputTokens);
@@ -179,15 +178,10 @@ describe('usage and billing', () => {
     const first = await readyDeployment();
     const second = await readyDeployment();
 
-    await ctx.app.inject({
-      method: 'POST',
-      url: `/v1/${first.id}/completions`,
-      payload: { prompt: 'hello' },
-      headers: { authorization: `Bearer ${first.apiKey}` },
-    });
+    await complete(first.id, first.apiKey, 'hello');
 
-    expect((await get(`api_key=${first.apiKey}`)).json().totals.requests).toBe(1);
-    expect((await get(`api_key=${second.apiKey}`)).json().totals.requests).toBe(0);
+    expect((await get(`api_key=${first.apiKey}`)).body.totals.requests).toBe(1);
+    expect((await get(`api_key=${second.apiKey}`)).body.totals.requests).toBe(0);
   });
 
   it('returns zeroed totals for a range with no usage', async () => {
@@ -195,9 +189,9 @@ describe('usage and billing', () => {
     const res = await get(
       `api_key=${apiKey}&from=2020-01-01T00:00:00.000Z&to=2020-02-01T00:00:00.000Z`,
     );
-    expect(res.statusCode).toBe(200);
-    expect(res.json().breakdown).toEqual([]);
-    expect(res.json().totals).toMatchObject({
+    expect(res.status).toBe(200);
+    expect(res.body.breakdown).toEqual([]);
+    expect(res.body.totals).toMatchObject({
       requests: 0,
       input_tokens: 0,
       output_tokens: 0,
@@ -211,32 +205,32 @@ describe('usage and billing', () => {
     const { apiKey } = await readyDeployment();
 
     const missing = await get('group_by=day');
-    expect(missing.statusCode).toBe(400);
-    expect(missing.json().error.code).toBe('validation_failed');
+    expect(missing.status).toBe(400);
+    expect(missing.body.error.code).toBe('validation_failed');
 
     const unknown = await get('api_key=sk_not_real');
-    expect(unknown.statusCode).toBe(401);
-    expect(unknown.json().error.code).toBe('invalid_api_key');
+    expect(unknown.status).toBe(401);
+    expect(unknown.body.error.code).toBe('invalid_api_key');
 
     const inverted = await get(
       `api_key=${apiKey}&from=2026-09-10T00:00:00.000Z&to=2026-09-09T00:00:00.000Z`,
     );
-    expect(inverted.statusCode).toBe(400);
-    expect(inverted.json().error.message).toContain('strictly before');
+    expect(inverted.status).toBe(400);
+    expect(inverted.body.error.message).toContain('strictly before');
 
     const tooWide = await get(
       `api_key=${apiKey}&from=2020-01-01T00:00:00.000Z&to=2026-01-01T00:00:00.000Z`,
     );
-    expect(tooWide.statusCode).toBe(400);
-    expect(tooWide.json().error.message).toContain('366 days');
+    expect(tooWide.status).toBe(400);
+    expect(tooWide.body.error.message).toContain('366 days');
 
     const badGrouping = await get(`api_key=${apiKey}&group_by=hour`);
-    expect(badGrouping.statusCode).toBe(400);
+    expect(badGrouping.status).toBe(400);
   });
 
   it('defaults to a day-aligned window covering the trailing 30 days plus today', async () => {
     const { apiKey } = await readyDeployment();
-    const body = (await get(`api_key=${apiKey}`)).json();
+    const body = (await get(`api_key=${apiKey}`)).body;
 
     // The clock sits at 2026-09-09T12:00:40Z, so the window must run to the
     // midnight after today — not to `now`, which as an exclusive bound would
@@ -250,16 +244,11 @@ describe('usage and billing', () => {
 
   it('includes an event recorded at the current instant in the default window', async () => {
     const { id, apiKey } = await readyDeployment();
-    const res = await ctx.app.inject({
-      method: 'POST',
-      url: `/v1/${id}/completions`,
-      payload: { prompt: 'right now' },
-      headers: { authorization: `Bearer ${apiKey}` },
-    });
-    expect(res.statusCode).toBe(200);
+    const res = await complete(id, apiKey, 'right now');
+    expect(res.status).toBe(200);
 
     const stored = await ctx.cols.usageEvents.findOne({});
     expect(stored?.occurred_at.toISOString()).toBe(ctx.clock.now().toISOString());
-    expect((await get(`api_key=${apiKey}`)).json().totals.requests).toBe(1);
+    expect((await get(`api_key=${apiKey}`)).body.totals.requests).toBe(1);
   });
 });

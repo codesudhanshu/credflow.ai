@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import type { LightMyRequestResponse } from 'fastify';
+import request from 'supertest';
 import { createTestApp, type TestApp } from '../helpers/testApp.js';
+
+type Response = Awaited<ReturnType<ReturnType<typeof request>['post']>>;
 
 describe('completions', () => {
   let ctx: TestApp;
@@ -19,15 +21,11 @@ describe('completions', () => {
 
   /** Creates a deployment and advances past its provisioning deadline. */
   async function readyDeployment(model = 'model-a'): Promise<{ id: string; apiKey: string }> {
-    const created = await ctx.app.inject({
-      method: 'POST',
-      url: '/deployments',
-      payload: { model },
-    });
-    const id = created.json().deployment_id as string;
+    const created = await request(ctx.app).post('/deployments').send({ model });
+    const id = created.body.deployment_id as string;
     ctx.clock.advance(10_000);
-    const ready = await ctx.app.inject({ method: 'GET', url: `/deployments/${id}` });
-    return { id, apiKey: ready.json().api_key as string };
+    const ready = await request(ctx.app).get(`/deployments/${id}`);
+    return { id, apiKey: ready.body.api_key as string };
   }
 
   async function post(
@@ -35,26 +33,21 @@ describe('completions', () => {
     apiKey: string | null,
     payload: Record<string, unknown>,
     extraHeaders: Record<string, string> = {},
-  ): Promise<LightMyRequestResponse> {
+  ): Promise<Response> {
     const headers: Record<string, string> = { ...extraHeaders };
     if (apiKey !== null) headers.authorization = `Bearer ${apiKey}`;
-    return await ctx.app.inject({
-      method: 'POST',
-      url: `/v1/${id}/completions`,
-      payload,
-      headers,
-    });
+    return request(ctx.app).post(`/v1/${id}/completions`).set(headers).send(payload);
   }
 
   it('returns the mocked response and meters it exactly once', async () => {
     const { id, apiKey } = await readyDeployment('model-b');
 
     const res = await post(id, apiKey, { prompt: 'a'.repeat(40) });
-    expect(res.statusCode).toBe(200);
-    expect(res.json().output).toBe('mocked response');
-    expect(res.json().input_tokens).toBe(10);
-    expect(res.json().output_tokens).toBeGreaterThanOrEqual(50);
-    expect(res.json().output_tokens).toBeLessThanOrEqual(200);
+    expect(res.status).toBe(200);
+    expect(res.body.output).toBe('mocked response');
+    expect(res.body.input_tokens).toBe(10);
+    expect(res.body.output_tokens).toBeGreaterThanOrEqual(50);
+    expect(res.body.output_tokens).toBeLessThanOrEqual(200);
 
     const events = await ctx.cols.usageEvents.find({}).toArray();
     expect(events).toHaveLength(1);
@@ -63,7 +56,7 @@ describe('completions', () => {
     expect(event.model).toBe('model-b');
     expect(event.tenant_id).toBe(ctx.demoTenantId);
     expect(event.input_tokens).toBe(10);
-    expect(event.output_tokens).toBe(res.json().output_tokens);
+    expect(event.output_tokens).toBe(res.body.output_tokens);
     expect(event.cost_micro_usd).toBe(event.input_tokens + 2 * event.output_tokens);
     expect(event.occurred_at.toISOString()).toBe(ctx.clock.now().toISOString());
   });
@@ -87,9 +80,9 @@ describe('completions', () => {
     let expectedOutput = 0;
     for (const prompt of prompts) {
       const res = await post(id, apiKey, { prompt });
-      expect(res.statusCode).toBe(200);
-      expectedInput += res.json().input_tokens as number;
-      expectedOutput += res.json().output_tokens as number;
+      expect(res.status).toBe(200);
+      expectedInput += res.body.input_tokens as number;
+      expectedOutput += res.body.output_tokens as number;
     }
 
     const events = await ctx.cols.usageEvents.find({}).toArray();
@@ -106,7 +99,12 @@ describe('completions', () => {
     const { id, apiKey } = await readyDeployment();
     const other = await readyDeployment();
 
-    const cases = [
+    const cases: Array<{
+      name: string;
+      run: () => Promise<Response>;
+      status: number;
+      code: string;
+    }> = [
       {
         name: 'no Authorization header',
         run: () => post(id, null, { prompt: 'hi' }),
@@ -153,8 +151,8 @@ describe('completions', () => {
 
     for (const testCase of cases) {
       const res = await testCase.run();
-      expect(res.statusCode, testCase.name).toBe(testCase.status);
-      expect(res.json().error.code, testCase.name).toBe(testCase.code);
+      expect(res.status, testCase.name).toBe(testCase.status);
+      expect(res.body.error.code, testCase.name).toBe(testCase.code);
     }
 
     // The central assertion: not one rejected request produced a billing record.
@@ -166,33 +164,29 @@ describe('completions', () => {
 
     // A second deployment created after the clock moved is still provisioning,
     // so we have a genuinely valid key for a deployment that cannot serve.
-    const pending = await ctx.app.inject({
-      method: 'POST',
-      url: '/deployments',
-      payload: { model: 'model-a' },
-    });
-    const pendingId = pending.json().deployment_id as string;
+    const pending = await request(ctx.app).post('/deployments').send({ model: 'model-a' });
+    const pendingId = pending.body.deployment_id as string;
     const pendingKey = (await ctx.cols.apiKeys.findOne({ deployment_id: pendingId }))!.secret;
 
     const res = await post(pendingId, pendingKey, { prompt: 'hi' });
-    expect(res.statusCode).toBe(409);
-    expect(res.json().error.code).toBe('deployment_not_ready');
-    expect(res.json().error.message).toContain('provisioning');
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('deployment_not_ready');
+    expect(res.body.error.message).toContain('provisioning');
     expect(await ctx.cols.usageEvents.countDocuments({})).toBe(0);
 
     // The ready deployment still works, proving the 409 was about state.
-    expect((await post(ready.id, ready.apiKey, { prompt: 'hi' })).statusCode).toBe(200);
+    expect((await post(ready.id, ready.apiKey, { prompt: 'hi' })).status).toBe(200);
   });
 
   it('409s a terminated deployment even though its key is still valid', async () => {
     const { id, apiKey } = await readyDeployment();
-    expect((await post(id, apiKey, { prompt: 'hi' })).statusCode).toBe(200);
+    expect((await post(id, apiKey, { prompt: 'hi' })).status).toBe(200);
 
-    await ctx.app.inject({ method: 'DELETE', url: `/deployments/${id}` });
+    await request(ctx.app).delete(`/deployments/${id}`);
 
     const res = await post(id, apiKey, { prompt: 'hi' });
-    expect(res.statusCode).toBe(409);
-    expect(res.json().error.message).toContain('terminated');
+    expect(res.status).toBe(409);
+    expect(res.body.error.message).toContain('terminated');
     expect(await ctx.cols.usageEvents.countDocuments({})).toBe(1);
   });
 
@@ -201,19 +195,19 @@ describe('completions', () => {
 
     for (let i = 0; i < ctx.env.RATE_LIMIT_PER_MINUTE; i += 1) {
       const res = await post(id, apiKey, { prompt: 'hi' });
-      expect(res.statusCode).toBe(200);
+      expect(res.status).toBe(200);
     }
 
     const denied = await post(id, apiKey, { prompt: 'hi' });
-    expect(denied.statusCode).toBe(429);
-    expect(denied.json().error.code).toBe('rate_limit_exceeded');
+    expect(denied.status).toBe(429);
+    expect(denied.body.error.code).toBe('rate_limit_exceeded');
     expect(denied.headers['retry-after']).toBeDefined();
     expect(denied.headers['x-ratelimit-remaining']).toBe('0');
 
     expect(await ctx.cols.usageEvents.countDocuments({})).toBe(ctx.env.RATE_LIMIT_PER_MINUTE);
 
     ctx.clock.advance(60_000);
-    expect((await post(id, apiKey, { prompt: 'hi' })).statusCode).toBe(200);
+    expect((await post(id, apiKey, { prompt: 'hi' })).status).toBe(200);
   });
 
   it('exposes rate-limit headers on a successful request', async () => {
@@ -232,9 +226,9 @@ describe('completions', () => {
     const first = await post(id, apiKey, { prompt: 'hello world' }, headers);
     const second = await post(id, apiKey, { prompt: 'hello world' }, headers);
 
-    expect(first.statusCode).toBe(200);
-    expect(second.statusCode).toBe(200);
-    expect(second.json()).toEqual(first.json());
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(second.body).toEqual(first.body);
     expect(await ctx.cols.usageEvents.countDocuments({})).toBe(1);
   });
 });

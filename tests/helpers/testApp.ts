@@ -1,5 +1,6 @@
-import type { FastifyInstance } from 'fastify';
+import type { Express } from 'express';
 import { FakeClock } from '../../src/clock.js';
+import { createLogger } from '../../src/logger.js';
 import { loadEnv, type Env } from '../../src/config/env.js';
 import { bootstrapDb } from '../../src/db/bootstrap.js';
 import { collections, type Collections } from '../../src/db/collections.js';
@@ -14,7 +15,7 @@ import { startMongo, type TestMongo } from './mongo.js';
 export const T0 = '2026-09-09T12:00:30.000Z';
 
 export interface TestApp {
-  app: FastifyInstance;
+  app: Express;
   cols: Collections;
   clock: FakeClock;
   env: Env;
@@ -39,18 +40,17 @@ export async function createTestApp(
   const cols = collections(mongo.db);
   const rateLimiter = createRateLimiter(env, cols);
 
-  const app = await buildServer({
+  const logger = createLogger(env);
+  const app = buildServer({
     env,
     clock,
     rng: seededRng(1_234),
+    logger,
     db: mongo.db,
     rateLimiter,
   });
-  await app.ready();
 
-  const sweeper = new ProvisioningSweeper(new DeploymentsRepo(cols), clock, env, {
-    error: () => {},
-  });
+  const sweeper = new ProvisioningSweeper(new DeploymentsRepo(cols), clock, env, logger);
 
   return {
     app,
@@ -69,8 +69,9 @@ export async function createTestApp(
       clock.set(T0);
     },
     close: async () => {
+      // Nothing to close on the app itself: buildServer never listens, so
+      // supertest opens and closes an ephemeral socket per request.
       sweeper.stop();
-      await app.close();
       await mongo.stop();
     },
   };
