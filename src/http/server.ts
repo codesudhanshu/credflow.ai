@@ -8,6 +8,7 @@ import { newId } from '../ids.js';
 import { registerErrorHandler } from './errorHandler.js';
 import { deploymentRoutes } from './routes/deployments.routes.js';
 import { completionRoutes } from './routes/completions.routes.js';
+import { usageRoutes } from './routes/usage.routes.js';
 
 /**
  * Everything the HTTP layer needs, passed in rather than imported, so tests
@@ -52,6 +53,7 @@ export async function buildServer(deps: AppDeps): Promise<FastifyInstance> {
   // transport-level behaviour can be tested in isolation.
   if (deps.db) {
     await app.register(deploymentRoutes, { prefix: '/deployments' });
+    await app.register(usageRoutes, { prefix: '/usage' });
   }
   if (deps.db && deps.rateLimiter) {
     await app.register(completionRoutes, { prefix: '/v1' });
