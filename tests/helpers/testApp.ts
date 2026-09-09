@@ -20,6 +20,11 @@ export interface TestApp {
   env: Env;
   sweeper: ProvisioningSweeper;
   demoTenantId: string;
+  /**
+   * Clears every collection except the seeded tenant and rewinds the clock, so
+   * one mongod can serve a whole test file instead of one per test.
+   */
+  reset(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -54,6 +59,15 @@ export async function createTestApp(
     env,
     sweeper,
     demoTenantId,
+    reset: async () => {
+      await Promise.all([
+        cols.deployments.deleteMany({}),
+        cols.apiKeys.deleteMany({}),
+        cols.usageEvents.deleteMany({}),
+        cols.rateLimitBuckets.deleteMany({}),
+      ]);
+      clock.set(T0);
+    },
     close: async () => {
       sweeper.stop();
       await app.close();
