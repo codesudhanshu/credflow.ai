@@ -1,0 +1,15 @@
+# Optional. The service boots its own in-process MongoDB when MONGODB_URI is
+# unset, so this file exists only for reviewers who would rather run a real one:
+#
+#   docker compose up -d mongo
+#   MONGODB_URI=mongodb://localhost:27017 npm run dev
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongo-data:/data/db
+
+volumes:
+  mongo-data:
