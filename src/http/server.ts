@@ -3,6 +3,7 @@ import type { Db } from 'mongodb';
 import type { Env } from '../config/env.js';
 import type { Clock } from '../clock.js';
 import type { Rng } from '../random.js';
+import type { RateLimiter } from '../ratelimit/limiter.js';
 import { newId } from '../ids.js';
 import { registerErrorHandler } from './errorHandler.js';
 import { deploymentRoutes } from './routes/deployments.routes.js';
@@ -18,8 +19,7 @@ export interface AppDeps {
   clock: Clock;
   rng: Rng;
   db?: Db;
-  /** Narrowed to RateLimiter once src/ratelimit exists. */
-  rateLimiter?: unknown;
+  rateLimiter?: RateLimiter;
 }
 
 declare module 'fastify' {
